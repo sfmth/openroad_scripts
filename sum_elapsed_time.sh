@@ -42,8 +42,18 @@ awk '
     next
   }
 
-  total += h * 3600 + min * 60 + s
+  step = FILENAME
+  sub(/^.*\//, "", step)
+
+  secs = h * 3600 + min * 60 + s
+  total += secs
   found = 1
+
+  sh = int(secs / 3600)
+  sm = int((secs % 3600) / 60)
+  ss = int(secs % 60)
+
+  printf "%s: %02d:%02d:%02d (h:m:s)\n", step, sh, sm, ss
 }
 END {
   if (!found) {
@@ -51,10 +61,10 @@ END {
     exit 1
   }
 
-  h = int(total / 3600)
-  m = int((total % 3600) / 60)
-  s = int(total % 60)
+  th = int(total / 3600)
+  tm = int((total % 3600) / 60)
+  ts = int(total % 60)
 
-  printf "Total elapsed time: %02d:%02d:%02d (h:m:s)\n", h, m, s
+  printf "Total elapsed time: %02d:%02d:%02d (h:m:s)\n", th, tm, ts
 }
 ' "$log_dir"/*.log
