@@ -34,6 +34,7 @@ import argparse
 import json
 import re
 import sys
+import fnmatch
 from collections import defaultdict, deque, Counter
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Set, Optional, Iterable
@@ -325,7 +326,8 @@ def parse_verilog_netlist(
     prim_counter = 0
 
     current_module: Optional[str] = None
-    MODULE_HDR_RE = re.compile(r"\bmodule\s+(?P<name>[A-Za-z_][A-Za-z0-9_\$]*)\b")
+    # Accept both normal and escaped module identifiers (Yosys uses escaped names with dots).
+    MODULE_HDR_RE = re.compile(rf"\bmodule\s+(?P<name>(?:{_ESCAPED_ID}|{_NORMAL_ID}))\b")
 
     def scope_name(name: str) -> str:
         return f"{current_module}/{name}" if current_module else name
@@ -493,7 +495,7 @@ def compute_hfn_reports(
     threshold: int,
     depth: int,
     top: int,
-    ignore_nets: Optional[Set[str]] = None,
+    ignore_nets: Optional[Iterable[str]] = None,
     auto_ignore_clk: bool = True,
     hop_report_depth: int = 0,
     ignore_undriven: bool = False,
@@ -503,7 +505,10 @@ def compute_hfn_reports(
     # Fanout is number of load pins (instance input pins) on the net
     fanout = {n: len(loads) for n, loads in net_loads.items()}
 
-    ignore_nets = ignore_nets or set()
+    ignore_patterns = list(ignore_nets or [])
+
+    def is_ignored(net: str) -> bool:
+        return any(fnmatch.fnmatchcase(net, pat) for pat in ignore_patterns)
 
     def base_name(net: str) -> str:
         b = net.rsplit("/", 1)[-1]
@@ -523,7 +528,7 @@ def compute_hfn_reports(
 
     hfn_set: Set[str] = {
         n for n, fo in fanout.items()
-        if fo >= threshold and n not in ignore_nets and not is_auto_ignored(n)
+        if fo >= threshold and not is_ignored(n) and not is_auto_ignored(n)
     }
 
     warnings: List[str] = []
@@ -611,11 +616,11 @@ def compute_hfn_reports(
             # expand via any non-ignored net connected to this instance (inputs and outputs)
             connected_nets = []
             for net in inst_inputs.get(inst, []):
-                if net in ignore_nets or is_auto_ignored(net):
+                if is_ignored(net) or is_auto_ignored(net):
                     continue
                 connected_nets.append(net)
             for net in inst_outputs.get(inst, []):
-                if net in ignore_nets or is_auto_ignored(net):
+                if is_ignored(net) or is_auto_ignored(net):
                     continue
                 connected_nets.append(net)
             for net in connected_nets:
@@ -817,13 +822,18 @@ Typical uses:
     ap.add_argument("--portdir-json", default=None, help="Optional JSON mapping cell-> {inputs:[..], outputs:[..]}")
     ap.add_argument("--out", default=None, help="Write JSON report to this path")
     ap.add_argument("--csv", default=None, help="Write CSV report to this path")
-    ap.add_argument("--ignore-net", action="append", default=None, help="Net name to ignore as HFN candidate (scoped name, repeatable)")
+    ap.add_argument(
+        "--ignore-net",
+        action="append",
+        default=None,
+        help="Net name or glob pattern to ignore as HFN candidate (e.g. foo/bar, */clk_i). Repeatable.",
+    )
     ap.add_argument("--hop-report", type=int, default=3, help="Show per-hop stats up to this depth (0=off) (default: 3)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--auto-ignore-clk", dest="auto_ignore_clk", action="store_true", help="Auto-ignore nets whose base name is CLK/clk (default)")
     g.add_argument("--no-auto-ignore-clk", dest="auto_ignore_clk", action="store_false", help="Do not auto-ignore CLK-named nets")
     ap.set_defaults(auto_ignore_clk=True)
-    ap.add_argument("--ignore-undriven", action="store_true", default=True, help="Drop HFNs that have zero drivers (no warning emitted for them) (default: on)")
+    ap.add_argument("--ignore-undriven", action="store_true", default=False, help="Drop HFNs that have zero drivers (no warning emitted for them) (default: on)")
     args = ap.parse_args()
 
     portdir_map = None
@@ -840,7 +850,7 @@ Typical uses:
         threshold=args.threshold,
         depth=args.depth,
         top=args.top,
-        ignore_nets=set(args.ignore_net or []),
+        ignore_nets=args.ignore_net or [],
         auto_ignore_clk=args.auto_ignore_clk,
         hop_report_depth=args.hop_report,
         ignore_undriven=args.ignore_undriven,
