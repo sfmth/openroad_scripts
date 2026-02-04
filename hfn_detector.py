@@ -177,6 +177,18 @@ class Instance:
     cell: str
     inputs: List[str]
     outputs: List[str]
+    # Optional: keep the original port mapping for hierarchy elaboration.
+    portmap: Optional[Dict[str, List[str]]] = None   # port name -> list of nets
+    pos_conns: Optional[List[List[str]]] = None      # positional port nets (per index)
+
+@dataclass
+class ModuleDef:
+    """Module definition as parsed from the netlist."""
+    name: str
+    ports_order: List[str]
+    port_dirs: Dict[str, str]            # port name -> "input"/"output"/"inout"/"unknown"
+    instances: List[Instance]
+    aliases: List[Tuple[str, str]]       # simple assign aliases (scoped to module)
 
 
 # ----------------------------
@@ -279,7 +291,7 @@ NAMED_PORT_RE = re.compile(r"\.(?P<port>[A-Za-z_][A-Za-z0-9_\$]*)\s*\(\s*(?P<exp
 # Accept escaped instance names so hierarchical names (with dots/slashes) are preserved.
 INST_NAME_RE = rf"(?:{_ESCAPED_ID}|{_NORMAL_ID})"
 INST_HDR_RE = re.compile(
-    rf"^\s*(?:\(\*.*?\*\)\s*)*(?P<cell>[A-Za-z_][A-Za-z0-9_\$]*)\s*"
+    rf"^\s*(?:\(\*.*?\*\)\s*)*(?P<cell>{INST_NAME_RE})\s*"
     rf"(?:#\s*\(.*\)\s*)?"
     rf"(?P<inst>{INST_NAME_RE})\s*\(\s*(?P<body>.*)\s*\)\s*$",
     flags=re.DOTALL
@@ -302,144 +314,272 @@ def parse_positional_ports(body: str) -> List[str]:
     """Return list of expressions in positional port connection list."""
     return split_top_level_commas(body)
 
-def parse_verilog_netlist(
+def _parse_module_header(stmt: str) -> Optional[Tuple[str, List[str]]]:
+    """
+    Try to parse 'module <name> (<ports>);' and return (name, [ports]).
+    """
+    MODULE_DEF_RE = re.compile(
+        rf"^\s*(?:\(\*.*?\*\)\s*)*module\s+(?P<name>(?:{_ESCAPED_ID}|{_NORMAL_ID}))\s*\((?P<ports>.*)\)\s*$",
+        flags=re.DOTALL,
+    )
+    m = MODULE_DEF_RE.match(stmt)
+    if not m:
+        return None
+    name = m.group("name")
+    ports_raw = m.group("ports")
+    parts = split_top_level_commas(ports_raw)
+    ports: List[str] = []
+    for p in parts:
+        # The port list can include directions/types; just pull identifiers.
+        ids = extract_identifiers(p)
+        if ids:
+            ports.append(ids[0])
+    return name, ports
+
+
+def parse_verilog_design(
     path: str,
     portdir_map: Optional[dict] = None,
-) -> Tuple[List[Instance], UnionFind]:
+) -> Dict[str, ModuleDef]:
     """
-    Parse a structural Verilog file into instances (with inferred input/output nets),
-    and net alias unions from simple assigns.
-    Module-local names are scoped as <module>/<name> to avoid cross-module collisions.
+    Parse a (possibly hierarchical) structural Verilog netlist into per-module
+    definitions. Nets are scoped as <module>/<name> inside each ModuleDef.
     """
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         raw = f.read()
 
     txt = strip_comments(raw)
 
-    instances: List[Instance] = []
-    uf = UnionFind()
+    MODULE_BLOCK_RE = re.compile(
+        rf"^\s*(?P<header>(?:\(\*.*?\*\)\s*)*module\s+(?P<name>(?:{_ESCAPED_ID}|{_NORMAL_ID}))\s*\((?P<ports>.*?)\)\s*;)"
+        rf"(?P<body>.*?)^\s*endmodule\b",
+        flags=re.DOTALL | re.MULTILINE,
+    )
 
-    # First pass: find simple assigns for aliasing
-    # Second pass: parse instances and non-trivial assigns as pseudo-cells
-    # (We do it in one pass here, unioning whenever we can.)
+    modules: Dict[str, ModuleDef] = {}
     assign_counter = 0
     prim_counter = 0
 
-    current_module: Optional[str] = None
-    # Accept both normal and escaped module identifiers (Yosys uses escaped names with dots).
-    MODULE_HDR_RE = re.compile(rf"\bmodule\s+(?P<name>(?:{_ESCAPED_ID}|{_NORMAL_ID}))\b")
+    for m in MODULE_BLOCK_RE.finditer(txt):
+        mod_name = m.group("name")
+        ports_raw = m.group("ports")
+        body = m.group("body")
 
-    def scope_name(name: str) -> str:
-        return f"{current_module}/{name}" if current_module else name
+        ports_order: List[str] = []
+        for p in split_top_level_commas(ports_raw):
+            ids = extract_identifiers(p)
+            if ids:
+                ports_order.append(ids[0])
 
-    for stmt in iter_statements(txt):
-        st = stmt.strip()
-        if not st:
-            continue
+        mod = ModuleDef(
+            name=mod_name,
+            ports_order=ports_order,
+            port_dirs={},
+            instances=[],
+            aliases=[],
+        )
+        modules[mod_name] = mod
 
-        # Track module scopes and skip the declarations themselves
-        m_mod = MODULE_HDR_RE.search(st)
-        if m_mod:
-            current_module = m_mod.group("name")
-            continue
-        if st.lower().startswith("endmodule"):
-            current_module = None
-            continue
+        def scope_name(name: str) -> str:
+            return f"{mod.name}/{name}"
 
-        # Skip net/param declarations (module scope tracked above)
-        low = st.lstrip().lower()
-        if low.startswith(("input ", "output ", "inout ", "wire ", "reg ", "logic ", "tri ", "parameter ", "localparam ")):
-            continue
+        for stmt in iter_statements(body):
+            st = stmt.strip()
+            if not st:
+                continue
 
-        # Continuous assign
-        m_as = ASSIGN_RE.match(st)
-        if m_as:
-            lhs_expr = m_as.group("lhs").strip()
-            rhs_expr = m_as.group("rhs").strip()
+            low = st.lstrip().lower()
+            if low.startswith(("input ", "output ", "inout ")):
+                dir_kw = "input" if low.startswith("input ") else "output" if low.startswith("output ") else "inout"
+                ids = extract_identifiers(st[len(dir_kw):])
+                for n in ids:
+                    mod.port_dirs[n] = dir_kw
+                continue
+            if low.startswith(("wire ", "reg ", "logic ", "tri ", "parameter ", "localparam ")):
+                continue
 
-            lhs_ids = [scope_name(x) for x in extract_identifiers(lhs_expr)]
-            rhs_ids = [scope_name(x) for x in extract_identifiers(rhs_expr)]
-
-            # If assign is a simple alias "assign a = b;" (single id each, no operators)
-            # we union them. Otherwise create a pseudo-instance dependency.
-            simple_alias = False
-            if len(lhs_ids) == 1 and len(rhs_ids) == 1:
-                # Check for operators in rhs/lhs (very rough)
-                if re.fullmatch(rf"\s*(?:{_ESCAPED_ID}|{_NORMAL_ID}{_INDEX})\s*", lhs_expr) and \
-                   re.fullmatch(rf"\s*(?:{_ESCAPED_ID}|{_NORMAL_ID}{_INDEX})\s*", rhs_expr):
-                    simple_alias = True
-
-            if simple_alias:
-                uf.union(lhs_ids[0], rhs_ids[0])
-            else:
-                assign_counter += 1
-                inst_name = scope_name(f"__assign_{assign_counter}")
-                cell_name = "__assign"
-                # Model as: rhs nets are inputs, lhs nets are outputs (often one net)
-                instances.append(Instance(
-                    name=inst_name,
-                    cell=cell_name,
-                    inputs=rhs_ids,
-                    outputs=lhs_ids,
-                ))
-            continue
-
-        # Primitive gate (positional)
-        m_prim = PRIM_RE.match(st)
-        if m_prim:
-            prim_counter += 1
-            inst_name = m_prim.group("inst") or f"__prim_{prim_counter}"
-            inst_name = scope_name(inst_name)
-            cell_name = m_prim.group("prim").lower()
-            body = m_prim.group("body")
-            exprs = parse_positional_ports(body)
-            if len(exprs) >= 1:
-                outs = [scope_name(n) for n in extract_identifiers(exprs[0])]
-                ins = []
-                for e in exprs[1:]:
-                    ins.extend(scope_name(n) for n in extract_identifiers(e))
-                instances.append(Instance(
-                    name=inst_name,
-                    cell=cell_name,
-                    inputs=ins,
-                    outputs=outs,
-                ))
-            continue
-
-        # Named-port instance
-        m_inst = INST_HDR_RE.match(st)
-        if m_inst:
-            cell = m_inst.group("cell")
-            inst = scope_name(m_inst.group("inst"))
-            body = m_inst.group("body")
-
-            conns = parse_named_ports(body)
-            in_nets: List[str] = []
-            out_nets: List[str] = []
-
-            for port, expr in conns:
-                ids = [scope_name(n) for n in extract_identifiers(expr)]
-                if not ids:
-                    continue
-                # If multiple IDs in an expr (rare in gate-level named ports),
-                # treat them as inputs; for outputs, keep the first.
-                if is_output_port(port, cell, portdir_map):
-                    out_nets.append(ids[0])
+            m_as = ASSIGN_RE.match(st)
+            if m_as:
+                lhs_expr = m_as.group("lhs").strip()
+                rhs_expr = m_as.group("rhs").strip()
+                lhs_ids = [scope_name(x) for x in extract_identifiers(lhs_expr)]
+                rhs_ids = [scope_name(x) for x in extract_identifiers(rhs_expr)]
+                simple_alias = False
+                if len(lhs_ids) == 1 and len(rhs_ids) == 1:
+                    if re.fullmatch(rf"\s*(?:{_ESCAPED_ID}|{_NORMAL_ID}{_INDEX})\s*", lhs_expr) and \
+                       re.fullmatch(rf"\s*(?:{_ESCAPED_ID}|{_NORMAL_ID}{_INDEX})\s*", rhs_expr):
+                        simple_alias = True
+                if simple_alias:
+                    mod.aliases.append((lhs_ids[0], rhs_ids[0]))
                 else:
-                    in_nets.extend(ids)
+                    assign_counter += 1
+                    inst_name = scope_name(f"__assign_{assign_counter}")
+                    mod.instances.append(Instance(
+                        name=inst_name,
+                        cell="__assign",
+                        inputs=rhs_ids,
+                        outputs=lhs_ids,
+                    ))
+                continue
 
-            instances.append(Instance(
-                name=inst,
-                cell=cell,
-                inputs=in_nets,
-                outputs=out_nets,
-            ))
+            m_prim = PRIM_RE.match(st)
+            if m_prim:
+                prim_counter += 1
+                inst_name = m_prim.group("inst") or f"__prim_{prim_counter}"
+                inst_name = scope_name(inst_name)
+                cell_name = m_prim.group("prim").lower()
+                exprs = parse_positional_ports(m_prim.group("body"))
+                if len(exprs) >= 1:
+                    outs = [scope_name(n) for n in extract_identifiers(exprs[0])]
+                    ins = []
+                    for e in exprs[1:]:
+                        ins.extend(scope_name(n) for n in extract_identifiers(e))
+                    mod.instances.append(Instance(
+                        name=inst_name,
+                        cell=cell_name,
+                        inputs=ins,
+                        outputs=outs,
+                    ))
+                continue
+
+            m_inst = INST_HDR_RE.match(st)
+            if m_inst:
+                cell = m_inst.group("cell")
+                inst = scope_name(m_inst.group("inst"))
+                body_conn = m_inst.group("body")
+                conns = parse_named_ports(body_conn)
+                in_nets: List[str] = []
+                out_nets: List[str] = []
+                portmap: Dict[str, List[str]] = {}
+                for port, expr in conns:
+                    ids = [scope_name(n) for n in extract_identifiers(expr)]
+                    if not ids:
+                        continue
+                    portmap[port] = ids
+                    if is_output_port(port, cell, portdir_map):
+                        out_nets.append(ids[0])
+                    else:
+                        in_nets.extend(ids)
+                mod.instances.append(Instance(
+                    name=inst,
+                    cell=cell,
+                    inputs=in_nets,
+                    outputs=out_nets,
+                    portmap=portmap,
+                ))
+                continue
+
+            m_pos = re.match(
+                rf"^\s*(?P<cell>{INST_NAME_RE})\s*"
+                rf"(?:#\s*\(.*\)\s*)?"
+                rf"(?P<inst>{INST_NAME_RE})\s*\(\s*(?P<body>.*)\s*\)\s*$",
+                st,
+                flags=re.DOTALL
+            )
+            if m_pos:
+                cell = m_pos.group("cell")
+                inst = scope_name(m_pos.group("inst"))
+                exprs = parse_positional_ports(m_pos.group("body"))
+                nets_per_pos = [[scope_name(n) for n in extract_identifiers(e)] for e in exprs]
+                mod.instances.append(Instance(
+                    name=inst,
+                    cell=cell,
+                    inputs=[],
+                    outputs=[],
+                    pos_conns=nets_per_pos,
+                ))
+                continue
+
+            # otherwise ignore (specify, etc.)
             continue
 
-        # Otherwise: ignore (could be specify blocks, etc.)
-        continue
+    return modules
 
-    return instances, uf
+
+# ----------------------------
+# Elaboration (hierarchy flattening)
+# ----------------------------
+
+def find_top_module(modules: Dict[str, ModuleDef], user_top: Optional[str]) -> str:
+    if user_top:
+        if user_top not in modules:
+            raise ValueError(f"--top '{user_top}' not found in design")
+        return user_top
+    instantiated: Set[str] = set()
+    for mod in modules.values():
+        for inst in mod.instances:
+            if inst.cell in modules:
+                instantiated.add(inst.cell)
+    candidates = [m for m in modules.keys() if m not in instantiated]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise ValueError("Could not determine top module (design may be recursive?) -- please pass --top")
+    raise ValueError(f"Ambiguous top modules: {', '.join(candidates)} -- please pass --top")
+
+
+def elaborate_design(
+    modules: Dict[str, ModuleDef],
+    top_module: str,
+) -> Tuple[List[Instance], UnionFind]:
+    """
+    Flatten the design logically: clone each module instance into a single
+    leaf-level instance list, remapping nets with hierarchical prefixes and
+    uniting port connections/aliases via UnionFind.
+    """
+    uf = UnionFind()
+    flat_instances: List[Instance] = []
+
+    def instantiate(mod_name: str, inst_path: str, port_binding: Dict[str, List[str]]):
+        mod = modules[mod_name]
+
+        def remap(net: str) -> str:
+            prefix = mod.name + "/"
+            local = net[len(prefix):] if net.startswith(prefix) else net
+            return f"{inst_path}/{local}" if inst_path else local
+
+        # Union port connections (formal <-> actual)
+        for formal, actuals in port_binding.items():
+            formal_net = remap(f"{mod.name}/{formal}")
+            for act in actuals:
+                uf.union(formal_net, act)
+
+        # Module-internal aliases
+        for a, b in mod.aliases:
+            uf.union(remap(a), remap(b))
+
+        for inst in mod.instances:
+            child_name = remap(inst.name)
+            remap_inputs = [remap(n) for n in inst.inputs]
+            remap_outputs = [remap(n) for n in inst.outputs]
+
+            if inst.cell in modules:
+                # Build child port binding
+                binding: Dict[str, List[str]] = {}
+                if inst.portmap:
+                    for p, nets in inst.portmap.items():
+                        binding[p] = [remap(n) for n in nets]
+                elif inst.pos_conns and modules[inst.cell].ports_order:
+                    po = modules[inst.cell].ports_order
+                    for idx, nets in enumerate(inst.pos_conns):
+                        if idx < len(po):
+                            binding.setdefault(po[idx], []).extend(remap(n) for n in nets)
+                # Recurse into child module
+                instantiate(inst.cell, child_name, binding)
+            else:
+                # Leaf / primitive / stdcell
+                flat_instances.append(Instance(
+                    name=child_name,
+                    cell=inst.cell,
+                    inputs=remap_inputs,
+                    outputs=remap_outputs,
+                ))
+
+    top_ports = modules[top_module].ports_order
+    top_binding = {p: [f"{top_module}/{p}"] for p in top_ports}
+    instantiate(top_module, top_module, top_binding)
+
+    return flat_instances, uf
 
 
 # ----------------------------
@@ -735,7 +875,7 @@ def print_human_summary(instances: List[Instance], reports: List[HFNReport], thr
             f"{r.cone_cells:>7} {r.cone_cells_with_hfn_input:>11} {r.cone_hfns_seen:>9}"
         )
 
-def print_hop_report(reports: List[HFNReport], hop_details: Dict[str, List[dict]], hop_depth: int, max_hfns_display: int = 8):
+def print_hop_report(reports: List[HFNReport], hop_details: Dict[str, List[dict]], hop_depth: int, threshold: int):
     if hop_depth <= 0:
         return
     print(f"\nPer-hop detail (depth <= {hop_depth}):")
@@ -748,10 +888,15 @@ def print_hop_report(reports: List[HFNReport], hop_details: Dict[str, List[dict]
         for h in hops:
             hfns = h.get("hfns_seen", [])
             disp_parts = []
-            for net, cnt in hfns[:max_hfns_display]:
+            # Show HFNs whose per-hop instance count meets the fanout threshold.
+            if threshold > 0:
+                shown = [(net, cnt) for net, cnt in hfns if cnt >= threshold]
+            else:
+                shown = hfns
+            for net, cnt in shown:
                 disp_parts.append(f"{net}({cnt})")
-            if len(hfns) > max_hfns_display:
-                disp_parts.append(f"... (+{len(hfns) - max_hfns_display} more)")
+            if threshold > 0 and len(shown) < len(hfns):
+                disp_parts.append(f"... (+{len(hfns) - len(shown)} below threshold)")
             disp = ", ".join(disp_parts)
             print(f"{h['depth']:>5} {h['insts']:>7} {h['insts_with_hfn']:>15}  {disp}")
 
@@ -834,6 +979,10 @@ Typical uses:
     g.add_argument("--no-auto-ignore-clk", dest="auto_ignore_clk", action="store_false", help="Do not auto-ignore CLK-named nets")
     ap.set_defaults(auto_ignore_clk=True)
     ap.add_argument("--ignore-undriven", action="store_true", default=False, help="Drop HFNs that have zero drivers (no warning emitted for them) (default: on)")
+    ap.add_argument("--top-module", default=None, help="Top module name (if not supplied, auto-detect from hierarchy)")
+    ap.add_argument("--no-elaborate", dest="elaborate", action="store_false", help="Do not elaborate/flatten hierarchy")
+    ap.add_argument("--elaborate", dest="elaborate", action="store_true", help="Elaborate/flatten hierarchy (default)")
+    ap.set_defaults(elaborate=True)
     args = ap.parse_args()
 
     portdir_map = None
@@ -843,7 +992,28 @@ Typical uses:
         if not isinstance(portdir_map, dict):
             raise ValueError("--portdir-json must be a JSON object at top level")
 
-    instances, uf = parse_verilog_netlist(args.verilog, portdir_map=portdir_map)
+    modules = parse_verilog_design(args.verilog, portdir_map=portdir_map)
+    top_module = find_top_module(modules, args.top_module)
+
+    if args.elaborate:
+        instances, uf = elaborate_design(modules, top_module)
+    else:
+        # legacy non-elaborated path: flatten only top module contents
+        uf = UnionFind()
+        top_prefix = top_module
+        def remap(inst: Instance) -> Instance:
+            def rp(net: str) -> str:
+                prefix = top_module + "/"
+                local = net[len(prefix):] if net.startswith(prefix) else net
+                return f"{top_prefix}/{local}" if top_prefix else local
+            return Instance(
+                name=rp(inst.name),
+                cell=inst.cell,
+                inputs=[rp(n) for n in inst.inputs],
+                outputs=[rp(n) for n in inst.outputs],
+            )
+        instances = [remap(i) for i in modules[top_module].instances]
+
     reports, hop_details, warnings = compute_hfn_reports(
         instances=instances,
         uf=uf,
@@ -867,7 +1037,7 @@ Typical uses:
 
     # warnings already collected pre-table
     print_human_summary(instances, reports, args.threshold, args.depth, warnings)
-    print_hop_report(reports, hop_details, args.hop_report)
+    print_hop_report(reports, hop_details, args.hop_report, args.threshold)
 
     if args.out:
         write_json(args.out, reports, meta, hop_details if args.hop_report > 0 else None)
