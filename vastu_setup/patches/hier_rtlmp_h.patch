@@ -1,0 +1,12 @@
+--- a/tools/OpenROAD/src/mpl/src/hier_rtlmp.h
++++ b/tools/OpenROAD/src/mpl/src/hier_rtlmp.h
+@@ -73,6 +73,9 @@
+   void init();
+   void run();
+   void blockMacroChannels();
++
++  // Vastu integration: dump cluster tree to JSON after autoclustering.
++  void dumpClusterTree(const char* output_path);
+
+   // Interfaces functions for setting options
+   // Hierarchical Macro Placement Related Options
