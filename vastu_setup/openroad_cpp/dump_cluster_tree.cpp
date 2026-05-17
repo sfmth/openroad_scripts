@@ -148,13 +148,30 @@ static void serialize_cluster(const Cluster* cluster,
     os << "\n      ]";
   }
 
-  // Leaf std cells — write to separate file if large
-  auto leaf_std_cells = cluster->getLeafStdCells();
-  if (!leaf_std_cells.empty()) {
-    if (leaf_std_cells.size() <= 10000) {
+  // Std cells of this cluster. RTLMP stores them in TWO places:
+  //   - leaf_std_cells_   : orphan std cells directly assigned (glue logic)
+  //   - db_modules_       : whole modules whose instances belong to this
+  //                         cluster — those cells live recursively under
+  //                         dbModule (use getLeafInsts() to flatten).
+  // Earlier versions only dumped leaf_std_cells_, which left ~94% of the
+  // design (everything inside module-named clusters like `i_frontend`) with
+  // no inst-name list — so vastu's tcl_writer seeded 0 cells for them, and
+  // the .odb after macro_place had only ~9.6k of 158k std cells placed.
+  std::vector<odb::dbInst*> cluster_std_cells = cluster->getLeafStdCells();
+  for (odb::dbModule* module : cluster->getDbModules()) {
+    for (odb::dbInst* inst : module->getLeafInsts()) {
+      if (inst->isBlock()) {
+        continue;  // macros handled separately above
+      }
+      cluster_std_cells.push_back(inst);
+    }
+  }
+
+  if (!cluster_std_cells.empty()) {
+    if (cluster_std_cells.size() <= 10000) {
       os << ",\n      \"leaf_instances\": [";
       bool first_inst = true;
-      for (odb::dbInst* inst : leaf_std_cells) {
+      for (odb::dbInst* inst : cluster_std_cells) {
         if (!first_inst) os << ", ";
         os << "\"" << json_escape(inst->getName()) << "\"";
         first_inst = false;
@@ -166,7 +183,7 @@ static void serialize_cluster(const Cluster* cluster,
           = "cluster_" + std::to_string(cluster->getId()) + "_insts.txt";
       std::string filepath = inst_list_dir + "/" + filename;
       std::ofstream inst_file(filepath);
-      for (odb::dbInst* inst : leaf_std_cells) {
+      for (odb::dbInst* inst : cluster_std_cells) {
         inst_file << inst->getName() << "\n";
       }
       inst_file.close();
@@ -186,6 +203,12 @@ static void serialize_cluster(const Cluster* cluster,
 
 void HierRTLMP::dumpClusterTree(const char* output_path)
 {
+  // setGlobalFence({}) falls back to the core area, populating
+  // tree_->global_fence so setFloorplanShape() yields a non-empty shape and
+  // movableCellsFitInMacroPlacementArea() can check against the real core.
+  // Without this, the area check sees floorplan_shape area == 0 → MPL-0065.
+  setGlobalFence(odb::Rect());
+
   // Run clustering only (steps 1 of run())
   runMultilevelAutoclustering();
 

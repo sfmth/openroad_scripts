@@ -48,6 +48,7 @@ def plot_floorplan(
     title: str | None = None,
     show_pins: bool = False,
     show_nets: bool = False,
+    show_leaf_labels: bool = True,
     figsize: tuple[float, float] = (8.0, 8.0),
 ):
     """Render a floorplan to a matplotlib figure.
@@ -106,8 +107,10 @@ def plot_floorplan(
             linewidth=1.2, edgecolor=edge, facecolor=face, alpha=0.7,
         )
         ax.add_patch(rect)
-        # Skip text for very small rectangles (illegible anyway).
-        if pl.w * pl.h > 25:
+        # Skip text for very small rectangles (illegible anyway), or when the
+        # caller has asked to suppress leaf labels entirely (e.g. cluster
+        # floorplans where leaf names are huge hierarchical paths).
+        if show_leaf_labels and pl.w * pl.h > 25:
             ax.text(
                 pl.x + pl.w / 2, pl.y + pl.h / 2, name,
                 ha="center", va="center", fontsize=8, color="#222",
@@ -170,7 +173,13 @@ def plot_floorplan(
             ax.plot(cx, cy, "x", markersize=3, color="#d4604c", alpha=0.6)
 
     ax.set_title(title or f"floorplan ({len(placements)} blocks)")
-    fig.tight_layout()
+    # tight_layout emits a noisy UserWarning when label boxes overflow the
+    # margin (common with long outer labels). The layout still renders fine;
+    # silence it so Tcl exec doesn't see stderr noise from a successful run.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        fig.tight_layout()
     if out_path:
         fig.savefig(out_path, dpi=120)
         plt.close(fig)

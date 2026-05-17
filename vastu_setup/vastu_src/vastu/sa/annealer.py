@@ -65,6 +65,36 @@ def _eval(state: FloorplanState, nets: list[Net], weights: CostWeights):
     return pr, cb
 
 
+def _outline_violation(total_w: float, total_h: float, weights: CostWeights) -> float:
+    """How much the packing exceeds the target outline.
+
+    Returns 0.0 if feasible (inside target_w x target_h, or fixed_outline is
+    off). When fixed_outline=True, this is treated as a HARD constraint by
+    the SA accept logic: moves that grow the violation from zero are rejected.
+    """
+    if not weights.fixed_outline:
+        return 0.0
+    v = 0.0
+    if weights.target_w is not None and total_w > weights.target_w:
+        v += total_w - weights.target_w
+    if weights.target_h is not None and total_h > weights.target_h:
+        v += total_h - weights.target_h
+    return v
+
+
+def _better_than(
+    cand_viol: float, cand_total: float, ref_viol: float, ref_total: float
+) -> bool:
+    """Best-tracking comparator: feasibility first, then cost."""
+    if cand_viol == 0.0 and ref_viol > 0.0:
+        return True
+    if cand_viol > 0.0 and ref_viol == 0.0:
+        return False
+    if cand_viol != ref_viol:
+        return cand_viol < ref_viol
+    return cand_total < ref_total
+
+
 def anneal(
     initial: FloorplanState,
     nets: Iterable[Net],
@@ -79,10 +109,15 @@ def anneal(
 
     state = initial.copy()
     pr, cb = _eval(state, nets_list, weights)
+    viol = _outline_violation(pr.total_w, pr.total_h, weights)
     best_state = state.copy()
     best_cb = cb
+    best_viol = viol
 
     # --- Warmup: compute T0 from observed |Δcost| at fully-random walk. ---
+    # Warmup performs an unconstrained random walk so the temperature scale
+    # reflects the natural cost noise. The hard-outline accept rule kicks in
+    # only in the main loop below.
     if config.t_initial > 0:
         T = config.t_initial
     else:
@@ -93,14 +128,16 @@ def anneal(
             cand = cur_state.copy()
             move = propose_move(cur_state, rng)
             move(cand)
-            _, cand_cb = _eval(cand, nets_list, weights)
+            cand_pr, cand_cb = _eval(cand, nets_list, weights)
+            cand_viol = _outline_violation(cand_pr.total_w, cand_pr.total_h, weights)
             d = cand_cb.total - cur_cb.total
             deltas.append(d)
             cur_state = cand
             cur_cb = cand_cb
-            if cand_cb.total < best_cb.total:
+            if _better_than(cand_viol, cand_cb.total, best_viol, best_cb.total):
                 best_state = cand.copy()
                 best_cb = cand_cb
+                best_viol = cand_viol
         positives = [d for d in deltas if d > 0]
         if positives:
             mean_pos = sum(positives) / len(positives)
@@ -121,15 +158,36 @@ def anneal(
             cand = state.copy()
             move = propose_move(state, rng)
             move(cand)
-            _, cand_cb = _eval(cand, nets_list, weights)
+            cand_pr, cand_cb = _eval(cand, nets_list, weights)
+            cand_viol = _outline_violation(cand_pr.total_w, cand_pr.total_h, weights)
             delta = cand_cb.total - cb.total
-            if delta <= 0 or rng.random() < math.exp(-delta / T):
+
+            # Feasibility-first accept rule. In fixed_outline mode, target_w x
+            # target_h is a HARD constraint: never leave feasibility, always
+            # enter it, and when both infeasible favor smaller violation.
+            if viol == 0.0 and cand_viol > 0.0:
+                accept = False
+            elif viol > 0.0 and cand_viol == 0.0:
+                accept = True
+            elif viol > 0.0 and cand_viol > 0.0:
+                if cand_viol < viol:
+                    accept = True
+                elif cand_viol > viol:
+                    accept = False
+                else:
+                    accept = delta <= 0 or rng.random() < math.exp(-delta / T)
+            else:
+                accept = delta <= 0 or rng.random() < math.exp(-delta / T)
+
+            if accept:
                 state = cand
                 cb = cand_cb
+                viol = cand_viol
                 accepted += 1
-                if cb.total < best_cb.total:
+                if _better_than(viol, cb.total, best_viol, best_cb.total):
                     best_state = state.copy()
                     best_cb = cb
+                    best_viol = viol
         cost_trace.append(cb.total)
         best_trace.append(best_cb.total)
         accept_trace.append(accepted / moves_per_temp)

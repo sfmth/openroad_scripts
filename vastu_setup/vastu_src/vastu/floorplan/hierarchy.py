@@ -61,10 +61,16 @@ def sample_shapes(
     ar_targets: tuple[float, ...],
     sa_config: AnnealConfig,
     *,
-    slack: float = 1.15,
+    slack: float = 1.03,
     sample_seed_offset: int = 100,
 ) -> list[tuple[float, float]]:
-    """Run an inner solve at each AR target; collect Pareto-distinct (w,h)."""
+    """Run an inner solve at each AR target; collect Pareto-distinct (w,h).
+
+    ``slack`` inflates the target outline above sum-of-block-area before each
+    inner solve. Lower slack ⇒ tighter Pareto shapes ⇒ less empty space when
+    the parent commits to a (w,h) for this block. Default 1.03 (3% headroom);
+    raise if the inner SA can't fit at some AR target.
+    """
     if not problem.blocks:
         return [(0.0, 0.0)]
     sum_area = sum(_block_area(b) for b in problem.blocks.values())
@@ -144,7 +150,10 @@ def solve_hierarchical(
     # If a fixed outline is requested, override weights for the top-level solve.
     if target_w is not None and target_h is not None:
         top_weights = CostWeights(
-            area_weight=0.0,
+            # Keep area_weight non-zero even with fixed outline: minimizing
+            # the bbox of placed blocks compacts them inside the hard outline
+            # instead of letting them spread out to chase wirelength alone.
+            area_weight=weights.area_weight,
             wirelength=weights.wirelength,
             outline_penalty=weights.outline_penalty if weights.outline_penalty > 0 else 50.0,
             overlap_penalty=weights.overlap_penalty,
@@ -175,6 +184,10 @@ def solve_hierarchical(
                 overlap_penalty=weights.overlap_penalty,
                 target_w=tgt_w,
                 target_h=tgt_h,
+                # Inner solves must respect the cluster's chosen shape as a
+                # hard outline; otherwise their macros leak past the cluster
+                # boundary, which makes the top-level packing invalid.
+                fixed_outline=True,
             )
             cfg = AnnealConfig(
                 seed=(sa_config.seed or 0) + 7919,

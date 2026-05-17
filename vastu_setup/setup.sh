@@ -157,9 +157,15 @@ else
 fi
 
 # --- rtl_mp.cpp ---
+# MacroPlacer lives in `namespace mpl { ... }`, so the definition must be
+# inserted *before* the closing brace of that namespace, not appended after.
 if ! grep -q "dumpClusterTree" "$MPL_SRC/rtl_mp.cpp"; then
-    cat >> "$MPL_SRC/rtl_mp.cpp" << 'CPPEOF'
-
+    "$VENV_PYTHON" - "$MPL_SRC/rtl_mp.cpp" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+insertion = '''
 // --- Vastu integration: dumpClusterTree factory method ---
 void MacroPlacer::dumpClusterTree(const int max_num_macro,
                                   const int min_num_macro,
@@ -181,7 +187,19 @@ void MacroPlacer::dumpClusterTree(const int max_num_macro,
 
   hier_rtlmp_->dumpClusterTree(output_path);
 }
-CPPEOF
+'''
+marker = re.compile(r'^\}\s*//\s*namespace\s+mpl\s*$', re.MULTILINE)
+matches = list(marker.finditer(content))
+if not matches:
+    sys.stderr.write('ERROR: could not find "} // namespace mpl" in rtl_mp.cpp\n')
+    sys.exit(1)
+last = matches[-1]
+new_content = content[:last.start()] + insertion + '\n' + content[last.start():]
+with open(path + '.bak', 'w') as f:
+    f.write(content)
+with open(path, 'w') as f:
+    f.write(new_content)
+PYEOF
     log "  Patched rtl_mp.cpp"
 else
     warn "  rtl_mp.cpp already patched — skipping"
@@ -251,6 +269,63 @@ fi
 # 5. ORFS flow scripts
 # ============================================================================
 log "Installing ORFS flow scripts..."
+
+# --- macro_place_util.tcl: honor MACRO_PLACEMENT_TCL_FULL to skip rtl_macro_placer ---
+# Default ORFS always runs rtl_macro_placer after sourcing MACRO_PLACEMENT_TCL.
+# Vastu replaces SA placement entirely, so it sets MACRO_PLACEMENT_TCL_FULL=1
+# from inside macro_place_vastu.tcl. This wrapper honors that flag.
+MACRO_PLACE_UTIL="$FLOW_SCRIPTS/macro_place_util.tcl"
+if ! grep -q "MACRO_PLACEMENT_TCL_FULL" "$MACRO_PLACE_UTIL"; then
+    "$VENV_PYTHON" - "$MACRO_PLACE_UTIL" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+old_source_block = '''  if { [env_var_exists_and_non_empty MACRO_PLACEMENT_TCL] } {
+    log_cmd source $::env(MACRO_PLACEMENT_TCL)
+  }'''
+new_source_block = '''  set skip_rtl_macro_placer 0
+  if { [env_var_exists_and_non_empty MACRO_PLACEMENT_TCL] } {
+    log_cmd source $::env(MACRO_PLACEMENT_TCL)
+    if { [env_var_exists_and_non_empty MACRO_PLACEMENT_TCL_FULL] } {
+      set skip_rtl_macro_placer 1
+    }
+  }'''
+if old_source_block not in content:
+    sys.stderr.write('ERROR: source block not found in macro_place_util.tcl\n')
+    sys.exit(1)
+content = content.replace(old_source_block, new_source_block, 1)
+
+old_call = '  log_cmd rtl_macro_placer {*}$all_args'
+new_call = '''  if { $skip_rtl_macro_placer } {
+    puts "MACRO_PLACEMENT_TCL_FULL set: skipping rtl_macro_placer."
+  } else {
+    log_cmd rtl_macro_placer {*}$all_args
+  }'''
+if old_call not in content:
+    sys.stderr.write('ERROR: rtl_macro_placer call not found in macro_place_util.tcl\n')
+    sys.exit(1)
+content = content.replace(old_call, new_call, 1)
+
+with open(path + '.bak', 'w') as f:
+    pass  # touch backup placeholder; real backup created on first patch only
+import shutil
+# Save original to .bak the first time we patch
+import os
+bak_path = path + '.bak'
+if not os.path.exists(bak_path) or os.path.getsize(bak_path) == 0:
+    with open(path) as f_orig:
+        with open(bak_path, 'w') as f_bak:
+            f_bak.write(f_orig.read())
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+    log "  Patched macro_place_util.tcl (MACRO_PLACEMENT_TCL_FULL gate)"
+else
+    warn "  macro_place_util.tcl already patched — skipping"
+fi
+
 cp "$SCRIPT_DIR/flow_scripts/macro_place_vastu.tcl" "$FLOW_SCRIPTS/macro_place_vastu.tcl"
 log "  Installed macro_place_vastu.tcl"
 cp "$SCRIPT_DIR/flow_scripts/run_vastu.sh" "$FLOW_SCRIPTS/run_vastu.sh"

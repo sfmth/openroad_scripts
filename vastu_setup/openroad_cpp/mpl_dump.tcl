@@ -43,13 +43,10 @@ proc dump_cluster_tree { args } {
   set large_net_threshold [expr {[info exists keys(-large_net_threshold)] ? $keys(-large_net_threshold) : 50}]
 
   if { [info exists keys(-halo_width)] && [info exists keys(-halo_height)] } {
+    # mpl::set_base_halo(left, bottom, right, top) takes micron-valued floats.
     set halo_w $keys(-halo_width)
     set halo_h $keys(-halo_height)
-    mpl::set_macro_base_halo_cmd \
-      [ord::microns_to_dbu $halo_w] \
-      [ord::microns_to_dbu $halo_h] \
-      [ord::microns_to_dbu $halo_w] \
-      [ord::microns_to_dbu $halo_h]
+    mpl::set_base_halo $halo_w $halo_h $halo_w $halo_h
   }
 
   mpl::dump_cluster_tree_cmd \

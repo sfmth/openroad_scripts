@@ -126,12 +126,13 @@ def _cluster_to_block(
             )
         inner = FloorplanProblem()
         for m in macros:
-            hx = m.get("halo_x", 0)
-            hy = m.get("halo_y", 0)
+            # halo_x/halo_y in JSON are TOTAL (left+right, top+bottom), in microns.
+            hx_total = m.get("halo_x", 0)
+            hy_total = m.get("halo_y", 0)
             blk = HardBlock(
                 name=m["inst_name"],
-                w=m["width"] + 2 * hx,
-                h=m["height"] + 2 * hy,
+                w=m["width"] + hx_total,
+                h=m["height"] + hy_total,
                 allowed_orients=(Orient.R0, Orient.R180, Orient.MX, Orient.MY),
                 module_name=m.get("name", m["inst_name"]),
             )
@@ -160,12 +161,13 @@ def _cluster_to_block(
     # Leaf mixed cluster: macros + std-cells
     inner = FloorplanProblem()
     for m in cluster.get("macros", []):
-        hx = m.get("halo_x", 0)
-        hy = m.get("halo_y", 0)
+        # halo_x/halo_y in JSON are TOTAL (left+right, top+bottom), in microns.
+        hx_total = m.get("halo_x", 0)
+        hy_total = m.get("halo_y", 0)
         blk = HardBlock(
             name=m["inst_name"],
-            w=m["width"] + 2 * hx,
-            h=m["height"] + 2 * hy,
+            w=m["width"] + hx_total,
+            h=m["height"] + hy_total,
             allowed_orients=(Orient.R0, Orient.R180, Orient.MX, Orient.MY),
             module_name=m.get("name", m["inst_name"]),
         )

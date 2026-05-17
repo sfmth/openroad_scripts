@@ -171,7 +171,10 @@ def _floorplan_clusters(args: argparse.Namespace) -> int:
         die_h = args.die_height
 
     weights = CostWeights(
-        area_weight=0.0,
+        # area_weight drives compactness inside the (hard) outline: minimizing
+        # total_w*total_h packs blocks together instead of letting SA spread
+        # them across the full outline just to minimize wirelength.
+        area_weight=args.area_weight,
         wirelength=args.wirelength_weight,
         outline_penalty=args.outline_penalty,
         overlap_penalty=10.0,
@@ -215,6 +218,9 @@ def _floorplan_clusters(args: argparse.Namespace) -> int:
             title=f"vastu: {problem.top_module}",
             show_nets=True,
             show_pins=False,
+            # Leaf labels are huge hierarchical RTL paths; they overlap and
+            # turn the plot into noise. Keep the outer (cluster) labels only.
+            show_leaf_labels=False,
             figsize=(args.plot_size, args.plot_size),
         )
         print(f"wrote {args.plot}")
@@ -268,8 +274,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="override die width from JSON (microns)")
     fc.add_argument("--die-height", type=float, default=None,
                     help="override die height from JSON (microns)")
-    fc.add_argument("--wirelength-weight", type=float, default=5.0)
+    fc.add_argument("--wirelength-weight", type=float, default=1.0,
+                    help="HPWL weight (default 1.0; reduced from 5.0 so it "
+                         "doesn't dominate compactness)")
     fc.add_argument("--outline-penalty", type=float, default=50.0)
+    fc.add_argument("--area-weight", type=float, default=50.0,
+                    help="bounding-box area weight (drives compactness inside "
+                         "the hard outline). Default 50 favors tight packing; "
+                         "lower if you need wirelength to dominate.")
     fc.add_argument("--target-utilization", type=float, default=0.7,
                     help="utilization for inflating std-cell cluster area")
     fc.add_argument("--max-temp-steps", type=int, default=100)

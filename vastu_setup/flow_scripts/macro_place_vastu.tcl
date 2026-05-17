@@ -11,13 +11,30 @@
 if { [find_macros] != "" } {
   puts "=== Vastu macro placement ==="
 
+  # Tell macro_place_util.tcl to skip rtl_macro_placer after we run.
+  # Vastu fully replaces the SA placement; the result is handed off to GPL.
+  set ::env(MACRO_PLACEMENT_TCL_FULL) 1
+
   # --- Step 1: Run RTLMP clustering only, dump to JSON ---
   set cluster_json "$::env(OBJECTS_DIR)/cluster_tree.json"
   file mkdir [file dirname $cluster_json]
 
   set clustering_args ""
-  if { [info exists ::env(RTLMP_MAX_LEVEL)] } {
-    append clustering_args " -max_num_level $::env(RTLMP_MAX_LEVEL)"
+  # Vastu thrives on a deep cluster tree (it solves recursively per level).
+  # Designs typically set RTLMP_MAX_LEVEL=1 because the stock SA placer
+  # works best flat; for vastu we want a real hierarchy.
+  # Precedence: VASTU_MAX_LEVEL > RTLMP_MAX_LEVEL > default 3.
+  if { [info exists ::env(VASTU_MAX_LEVEL)] } {
+    append clustering_args " -max_num_level $::env(VASTU_MAX_LEVEL)"
+  } elseif { [info exists ::env(RTLMP_MAX_LEVEL)] } {
+    # If the design pins RTLMP_MAX_LEVEL to a small value (typical: 1) bump
+    # the floor to 3 so vastu sees a usable hierarchy. Larger values pass
+    # through unchanged.
+    set lvl $::env(RTLMP_MAX_LEVEL)
+    if { $lvl < 3 } { set lvl 3 }
+    append clustering_args " -max_num_level $lvl"
+  } else {
+    append clustering_args " -max_num_level 3"
   }
   if { [info exists ::env(RTLMP_MAX_INST)] } {
     append clustering_args " -max_num_inst $::env(RTLMP_MAX_INST)"
@@ -69,12 +86,22 @@ if { [find_macros] != "" } {
   if { [info exists ::env(VASTU_MOVES_PER_TEMP)] } {
     append vastu_args " --moves-per-temp $::env(VASTU_MOVES_PER_TEMP)"
   }
+  # Always dump a visual of the placement to the design's reports dir so it
+  # ships with the rest of the per-stage artifacts. VASTU_PLOT env overrides.
   if { [info exists ::env(VASTU_PLOT)] } {
-    append vastu_args " --plot $::env(VASTU_PLOT)"
+    set vastu_plot $::env(VASTU_PLOT)
+  } elseif { [info exists ::env(REPORTS_DIR)] } {
+    set vastu_plot "$::env(REPORTS_DIR)/vastu_floorplan.png"
+  } else {
+    set vastu_plot "$::env(OBJECTS_DIR)/vastu_floorplan.png"
   }
+  file mkdir [file dirname $vastu_plot]
+  append vastu_args " --plot $vastu_plot"
 
   puts "Running vastu: $vastu_runner $vastu_args"
-  exec bash $vastu_runner {*}$vastu_args
+  # -ignorestderr: matplotlib + setuptools may emit harmless UserWarnings on
+  # stderr; Tcl's exec would otherwise raise even when the subprocess exit is 0.
+  exec -ignorestderr bash $vastu_runner {*}$vastu_args 2>@stderr
 
   # --- Step 3: Load placements and regions back into OpenROAD ---
   puts "Loading vastu results from $vastu_out"
